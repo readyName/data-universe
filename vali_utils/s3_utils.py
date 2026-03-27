@@ -144,6 +144,8 @@ class DuckDBSampledValidator:
     # Missing URLs = instant fail (no rate threshold needed)
     MIN_JOB_MATCH_RATE = 95.0   # 95% min job content match rate
     MIN_SCRAPER_SUCCESS = 80.0  # 80% min scraper success rate
+    MIN_ENGAGEMENT_RATE = 95.0  # 95% of X rows must have non-null view_count
+    MIN_UNIQUE_CONTENT_RATIO = 10.0  # 10% min unique tweet_ids / total rows
 
     # File size limits - prevent empty file exploit and oversized file OOM
     MIN_FILE_SIZE_BYTES = 15_000                   # 15KB - empty parquet header ≈ 8KB
@@ -152,7 +154,7 @@ class DuckDBSampledValidator:
 
     # Scraper validation window — only files uploaded within this window are scraper-validated.
     # Older files rely on credibility from previous validation cycles.
-    SCRAPER_MAX_AGE_HOURS = 24
+    SCRAPER_MAX_AGE_HOURS = 72
 
     # Standard bytes per row for effective_size cap.
     # Real production data: X=77-515 B/row, Reddit=182-1682 B/row.
@@ -369,14 +371,15 @@ class DuckDBSampledValidator:
                         f"{miner_hotkey}: No recent files within {self.SCRAPER_MAX_AGE_HOURS}h — "
                         f"skipping scraper validation (credibility covers older data)"
                     )
-                    scraper_result = {'entities_validated': 0, 'entities_passed': 0, 'success_rate': 100.0, 'sample_results': []}
+                    scraper_result = {'entities_validated': 0, 'entities_passed': 0, 'success_rate': None, 'sample_results': []}
 
             # Step 7: Validation decision
             issues = []
             duplicate_rate = duckdb_result["duplicate_rate_within_job"]
             empty_rate = duckdb_result["empty_rate"]
             job_match_rate = job_match_result['match_rate']
-            scraper_success_rate = scraper_result['success_rate']
+            scraper_success_rate = scraper_result['success_rate']  # None when no recent files
+            scraper_success_rate_display = scraper_success_rate if scraper_success_rate is not None else -1.0
             compression_failures = duckdb_result.get("compression_failures", 0)
             row_count_mismatches = duckdb_result.get("row_count_mismatches", 0)
 
@@ -390,7 +393,7 @@ class DuckDBSampledValidator:
                 issues.append(f"High empty content: {empty_rate:.1f}%")
             if job_match_rate < self.MIN_JOB_MATCH_RATE:
                 issues.append(f"Low job match: {job_match_rate:.1f}%")
-            if scraper_success_rate < self.MIN_SCRAPER_SUCCESS:
+            if scraper_success_rate is not None and scraper_success_rate < self.MIN_SCRAPER_SUCCESS:
                 issues.append(f"Low scraper success: {scraper_success_rate:.1f}%")
 
             # Compression exploit detection — always fail
@@ -440,7 +443,7 @@ class DuckDBSampledValidator:
                 bt.logging.success(
                     f"{miner_hotkey}: S3 validation PASSED in {elapsed:.1f}s - "
                     f"effective_size={effective_size_bytes/(1024*1024):.1f}MB, "
-                    f"dup={duplicate_rate:.1f}%, job_match={job_match_rate:.1f}%, scraper={scraper_success_rate:.1f}%"
+                    f"dup={duplicate_rate:.1f}%, job_match={job_match_rate:.1f}%, scraper={scraper_success_rate_display:.1f}%"
                 )
             else:
                 bt.logging.warning(
@@ -451,7 +454,7 @@ class DuckDBSampledValidator:
                     f"{miner_hotkey}: S3 validation details - "
                     f"dup={duplicate_rate:.1f}% (max {self.MAX_DUPLICATE_RATE}%), "
                     f"job_match={job_match_rate:.1f}% (min {self.MIN_JOB_MATCH_RATE}%), "
-                    f"scraper={scraper_success_rate:.1f}% (min {self.MIN_SCRAPER_SUCCESS}%), "
+                    f"scraper={scraper_success_rate_display:.1f}% (min {self.MIN_SCRAPER_SUCCESS}%), "
                     f"compression_fails={compression_failures}, "
                     f"row_count_mismatches={row_count_mismatches}"
                 )
@@ -468,7 +471,7 @@ class DuckDBSampledValidator:
                 duplicate_percentage=duplicate_rate,
                 entities_validated=scraper_result['entities_validated'],
                 entities_passed_scraper=scraper_result['entities_passed'],
-                scraper_success_rate=scraper_success_rate,
+                scraper_success_rate=scraper_success_rate if scraper_success_rate is not None else 0.0,
                 entities_checked_for_job_match=job_match_result['total_checked'],
                 entities_matched_job=job_match_result['total_matched'],
                 job_match_rate=job_match_rate,
@@ -594,6 +597,12 @@ class DuckDBSampledValidator:
         dedup_total = 0
         dedup_duplicates = 0
 
+        # Engagement & content uniqueness tracking (X/Twitter only)
+        engagement_total_rows = 0
+        engagement_missing_rows = 0
+        unique_tweet_ids: set = set()
+        total_tweet_id_rows = 0
+
         # Limit to 20 files max for checks
         files_to_check = random.sample(sampled_files, min(20, len(sampled_files)))
 
@@ -707,7 +716,7 @@ class DuckDBSampledValidator:
 
                 # --- PyArrow row-group read for empty/missing content check ---
                 if platform in ['x', 'twitter']:
-                    read_cols = ['url', 'text']
+                    read_cols = ['url', 'text', 'view_count', 'tweet_id']
                 else:
                     read_cols = ['url', 'body', 'title']
                 read_cols = [c for c in read_cols if c in available_columns]
@@ -743,6 +752,45 @@ class DuckDBSampledValidator:
                         empty_mask = body_empty & title_empty
                     empty_count += int(empty_mask.sum())
 
+                    # X-only: engagement, uniqueness, and URL↔tweet_id consistency
+                    if platform in ['x', 'twitter']:
+                        # Engagement: view_count must be non-null
+                        if 'view_count' in rg_df.columns:
+                            views = pd.to_numeric(rg_df['view_count'], errors='coerce')
+                            engagement_total_rows += len(views)
+                            engagement_missing_rows += int(views.isna().sum())
+
+                        # Unique tweet_id ratio
+                        if 'tweet_id' in rg_df.columns:
+                            ids = rg_df['tweet_id'].dropna().astype(str)
+                            total_tweet_id_rows += len(ids)
+                            unique_tweet_ids.update(ids.tolist())
+
+                            # URL↔tweet_id consistency: status ID in URL must match tweet_id
+                            if 'url' in rg_df.columns:
+                                url_id_mismatches = 0
+                                check_df = rg_df[['url', 'tweet_id']].dropna()
+                                for _, r in check_df.head(500).iterrows():
+                                    url_str = str(r['url'])
+                                    tid = str(r['tweet_id'])
+                                    if '/status/' in url_str:
+                                        url_status_id = url_str.split('/status/')[-1].split('?')[0].split('/')[0]
+                                        if url_status_id != tid:
+                                            url_id_mismatches += 1
+                                if url_id_mismatches > 0:
+                                    mismatch_rate = url_id_mismatches / min(len(check_df), 500) * 100
+                                    bt.logging.warning(
+                                        f"URL↔tweet_id mismatch: {url_id_mismatches} rows have "
+                                        f"different status ID in URL vs tweet_id ({mismatch_rate:.1f}%)"
+                                    )
+                                    return {
+                                        "success": False,
+                                        "duplicate_rate_within_job": 100.0,
+                                        "empty_rate": 100.0,
+                                        "total_rows": 0,
+                                        "reason": f"URL↔tweet_id mismatch in {url_id_mismatches} rows ({mismatch_rate:.1f}%)"
+                                    }
+
             except Exception as e:
                 bt.logging.debug(f"Sampled validation error for file: {e}")
                 continue
@@ -774,6 +822,40 @@ class DuckDBSampledValidator:
                 f"({dedup_duplicates}/{dedup_total} urls across {len(dedup_hashes_by_job)} jobs)"
             )
 
+        # Engagement check (X only): legit scrapers always return view_count
+        engagement_rate = 0.0
+        if engagement_total_rows > 0:
+            engagement_rate = ((engagement_total_rows - engagement_missing_rows) / engagement_total_rows * 100)
+            if engagement_rate < self.MIN_ENGAGEMENT_RATE:
+                bt.logging.warning(
+                    f"Engagement FAILED: {engagement_rate:.1f}% rows have view_count "
+                    f"(min {self.MIN_ENGAGEMENT_RATE}%)"
+                )
+                return {
+                    "success": False,
+                    "duplicate_rate_within_job": duplicate_rate,
+                    "empty_rate": 100.0,
+                    "total_rows": 0,
+                    "reason": f"Missing engagement: only {engagement_rate:.1f}% rows have view_count"
+                }
+
+        # Unique content ratio (X only): catches bulk-duplicated tweets
+        unique_ratio = 0.0
+        if total_tweet_id_rows > 0:
+            unique_ratio = (len(unique_tweet_ids) / total_tweet_id_rows * 100)
+            if unique_ratio < self.MIN_UNIQUE_CONTENT_RATIO:
+                bt.logging.warning(
+                    f"Unique content FAILED: {unique_ratio:.1f}% unique tweet_ids "
+                    f"({len(unique_tweet_ids)}/{total_tweet_id_rows})"
+                )
+                return {
+                    "success": False,
+                    "duplicate_rate_within_job": duplicate_rate,
+                    "empty_rate": 100.0,
+                    "total_rows": 0,
+                    "reason": f"Low content uniqueness: {unique_ratio:.1f}% unique tweet_ids"
+                }
+
         if total_rows == 0:
             return {
                 "success": True,
@@ -789,7 +871,8 @@ class DuckDBSampledValidator:
         bt.logging.info(
             f"Sampled validation: {total_rows} rows, "
             f"dup={duplicate_rate:.1f}% (per-job, {len(dedup_hashes_by_job)} jobs), "
-            f"empty={empty_rate:.1f}%, compression_fails={compression_failures}"
+            f"empty={empty_rate:.1f}%, engagement={engagement_rate:.1f}%, "
+            f"unique_ids={unique_ratio:.1f}%, compression_fails={compression_failures}"
         )
 
         return {
