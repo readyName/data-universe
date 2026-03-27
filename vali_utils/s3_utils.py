@@ -597,11 +597,11 @@ class DuckDBSampledValidator:
         dedup_total = 0
         dedup_duplicates = 0
 
-        # Engagement & content uniqueness tracking (X/Twitter only)
+        # Engagement & content uniqueness tracking
         engagement_total_rows = 0
         engagement_missing_rows = 0
-        unique_tweet_ids: set = set()
-        total_tweet_id_rows = 0
+        unique_content_ids: set = set()
+        total_content_id_rows = 0
 
         # Limit to 20 files max for checks
         files_to_check = random.sample(sampled_files, min(20, len(sampled_files)))
@@ -718,7 +718,7 @@ class DuckDBSampledValidator:
                 if platform in ['x', 'twitter']:
                     read_cols = ['url', 'text', 'view_count', 'tweet_id']
                 else:
-                    read_cols = ['url', 'body', 'title']
+                    read_cols = ['url', 'body', 'title', 'id']
                 read_cols = [c for c in read_cols if c in available_columns]
                 if 'url' not in read_cols:
                     read_cols.append('url')
@@ -763,8 +763,8 @@ class DuckDBSampledValidator:
                         # Unique tweet_id ratio
                         if 'tweet_id' in rg_df.columns:
                             ids = rg_df['tweet_id'].dropna().astype(str)
-                            total_tweet_id_rows += len(ids)
-                            unique_tweet_ids.update(ids.tolist())
+                            total_content_id_rows += len(ids)
+                            unique_content_ids.update(ids.tolist())
 
                             # URL↔tweet_id consistency: status ID in URL must match tweet_id
                             if 'url' in rg_df.columns:
@@ -790,6 +790,13 @@ class DuckDBSampledValidator:
                                         "total_rows": 0,
                                         "reason": f"URL↔tweet_id mismatch in {url_id_mismatches} rows ({mismatch_rate:.1f}%)"
                                     }
+
+                    # Reddit: unique id ratio
+                    elif platform == 'reddit':
+                        if 'id' in rg_df.columns:
+                            ids = rg_df['id'].dropna().astype(str)
+                            total_content_id_rows += len(ids)
+                            unique_content_ids.update(ids.tolist())
 
             except Exception as e:
                 bt.logging.debug(f"Sampled validation error for file: {e}")
@@ -839,21 +846,21 @@ class DuckDBSampledValidator:
                     "reason": f"Missing engagement: only {engagement_rate:.1f}% rows have view_count"
                 }
 
-        # Unique content ratio (X only): catches bulk-duplicated tweets
+        # Unique content ratio: catches bulk-duplicated content (X: tweet_id, Reddit: id)
         unique_ratio = 0.0
-        if total_tweet_id_rows > 0:
-            unique_ratio = (len(unique_tweet_ids) / total_tweet_id_rows * 100)
+        if total_content_id_rows > 0:
+            unique_ratio = (len(unique_content_ids) / total_content_id_rows * 100)
             if unique_ratio < self.MIN_UNIQUE_CONTENT_RATIO:
                 bt.logging.warning(
-                    f"Unique content FAILED: {unique_ratio:.1f}% unique tweet_ids "
-                    f"({len(unique_tweet_ids)}/{total_tweet_id_rows})"
+                    f"Unique content FAILED: {unique_ratio:.1f}% unique content IDs "
+                    f"({len(unique_content_ids)}/{total_content_id_rows})"
                 )
                 return {
                     "success": False,
                     "duplicate_rate_within_job": duplicate_rate,
                     "empty_rate": 100.0,
                     "total_rows": 0,
-                    "reason": f"Low content uniqueness: {unique_ratio:.1f}% unique tweet_ids"
+                    "reason": f"Low content uniqueness: {unique_ratio:.1f}% unique content IDs"
                 }
 
         if total_rows == 0:
