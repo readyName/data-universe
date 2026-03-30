@@ -20,7 +20,7 @@ class MinerScorer:
     # v2: Reset effective_sizes and s3_boosts to zero (exploit inflated sizes)
     # v3: Reset on-demand boosts/credibility (empty submissions were earning free credibility)
     # v4: Reset on-demand again after data existence probe + reddit body fix
-    STATE_VERSION = 4
+    STATE_VERSION = 5
 
     # Start new miner's at a credibility of 0.
     STARTING_CREDIBILITY = 0
@@ -126,14 +126,13 @@ class MinerScorer:
             self.effective_sizes = state.get("effective_sizes", torch.zeros(self.scores.size(0), dtype=torch.float64))
 
             # --- State migrations ---
-            if saved_version < 2:
-                # v1 -> v2: Full reset — pre-v2 scores were inflated by
-                # compression/URI-padding exploits. Clean slate for all miners.
+            if saved_version < 5:
+                # -> v5: Full S3 reset — engagement/uniqueness/URL checks
+                # reveal widespread exploit. Clean slate for all miners.
                 bt.logging.warning(
-                    f"State migration v{saved_version} -> v2: "
-                    f"Full state reset."
+                    f"State migration v{saved_version} -> v5: "
+                    f"Full S3 + on-demand reset."
                 )
-                num = self.scores.size(0)
                 self.scores.zero_()
                 self.miner_credibility.fill_(MinerScorer.STARTING_CREDIBILITY)
                 self.scorable_bytes.zero_()
@@ -142,26 +141,6 @@ class MinerScorer:
                 self.ondemand_boosts.zero_()
                 self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
                 self.effective_sizes.zero_()
-
-            if saved_version < 3:
-                # v2 -> v3: Reset on-demand state only — empty submissions were
-                # earning free credibility, inflating on-demand scores.
-                bt.logging.warning(
-                    f"State migration v{saved_version} -> v3: "
-                    f"Resetting on-demand boosts and credibility."
-                )
-                self.ondemand_boosts.zero_()
-                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
-
-            if saved_version < 4:
-                # v3 -> v4: Reset on-demand again after data existence probe
-                # and reddit body/title validation fix.
-                bt.logging.warning(
-                    f"State migration v{saved_version} -> v4: "
-                    f"Resetting on-demand boosts and credibility."
-                )
-                self.ondemand_boosts.zero_()
-                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
 
     def get_scores(self) -> torch.Tensor:
         """Returns the raw scores of all miners."""
