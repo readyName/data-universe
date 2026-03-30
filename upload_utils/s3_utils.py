@@ -62,29 +62,34 @@ class S3Auth:
             return None
 
     def upload_file(self, file_path: str, creds: Dict[str, Any]) -> bool:
-        """Upload file to the basic folder structure"""
+        """Upload file to the basic folder structure. Supports both POST (DO) and PUT (R2)."""
         try:
             key = f"{creds['folder']}{os.path.basename(file_path)}"
-            post_data = dict(creds['fields'])  # clone all fields (V4-compatible)
-            post_data['key'] = key  # overwrite key with actual file key
+            method = creds.get('method', 'POST')
 
             with open(file_path, 'rb') as f:
-                files = {'file': f}
-                response = requests.post(creds['url'], data=post_data, files=files)
+                if method == 'PUT':
+                    response = requests.put(creds['url'], data=f.read(),
+                                            headers={'Content-Type': 'application/octet-stream'})
+                else:
+                    post_data = dict(creds['fields'])
+                    post_data['key'] = key
+                    files = {'file': f}
+                    response = requests.post(creds['url'], data=post_data, files=files)
 
-            if response.status_code == 204:
-                bt.logging.info(f"✅ Upload success: {key}")
+            if response.status_code in (200, 204):
+                bt.logging.info(f"Upload success: {key}")
                 return True
             else:
-                bt.logging.error(f"❌ Upload failed: {response.status_code} — {response.text}")
+                bt.logging.error(f"Upload failed: {response.status_code} — {response.text}")
                 return False
 
         except Exception as e:
-            bt.logging.error(f"❌ S3 Upload Exception for {file_path}: {e}")
+            bt.logging.error(f"S3 Upload Exception for {file_path}: {e}")
             return False
 
     def upload_file_with_path(self, file_path: str, s3_path: str, creds: Dict[str, Any]) -> bool:
-        """Upload file with custom S3 path for job-based uploads
+        """Upload file with custom S3 path. Supports both POST (DO) and PUT (R2).
 
         Args:
             file_path: Local file path
@@ -92,31 +97,31 @@ class S3Auth:
             creds: S3 credentials from API
         """
         try:
-            # Get the folder prefix from credentials (base_url)
             folder_prefix = creds.get('folder', '')
-
-            # Construct the full S3 path by appending our relative path to the folder prefix
-            # This creates: base_url/hotkey={hotkey_id}/job_id={job_id}/filename.parquet
             full_s3_path = f"{folder_prefix}{s3_path}"
+            method = creds.get('method', 'POST')
 
-            bt.logging.info(f"🔄 Uploading to S3 path: {full_s3_path}")
-
-            post_data = dict(creds['fields'])  # clone all fields (V4-compatible)
-            post_data['key'] = full_s3_path  # use the full path
+            bt.logging.info(f"Uploading to S3 path: {full_s3_path}")
 
             with open(file_path, 'rb') as f:
-                files = {'file': f}
-                response = requests.post(creds['url'], data=post_data, files=files)
+                if method == 'PUT':
+                    response = requests.put(creds['url'], data=f.read(),
+                                            headers={'Content-Type': 'application/octet-stream'})
+                else:
+                    post_data = dict(creds['fields'])
+                    post_data['key'] = full_s3_path
+                    files = {'file': f}
+                    response = requests.post(creds['url'], data=post_data, files=files)
 
-            if response.status_code == 204:
-                bt.logging.success(f"✅ S3 upload success: {full_s3_path}")
+            if response.status_code in (200, 204):
+                bt.logging.success(f"S3 upload success: {full_s3_path}")
                 return True
             else:
-                bt.logging.error(f"❌ S3 upload failed: {response.status_code} — {response.text}")
+                bt.logging.error(f"S3 upload failed: {response.status_code} — {response.text}")
                 return False
 
         except Exception as e:
-            bt.logging.error(f"❌ S3 Upload Exception for {file_path} -> {s3_path}: {e}")
+            bt.logging.error(f"S3 Upload Exception for {file_path} -> {s3_path}: {e}")
             return False
 
     def get_structure_info(self) -> Optional[Dict[str, Any]]:

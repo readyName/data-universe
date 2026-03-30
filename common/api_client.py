@@ -28,8 +28,9 @@ class MinerFileUploadResponse(BaseModel):
     """Response from POST /get-file-upload-url."""
     s3_key: str
     url: str
-    fields: Dict[str, str]
+    fields: Dict[str, str] = {}
     expires_in_seconds: int
+    method: str = "POST"  # "POST" (DO Spaces) or "PUT" (R2)
 
 
 class DynamicDesirabilityListEntry(BaseModel):
@@ -386,23 +387,27 @@ class DataUniverseApiClient:
         self, *, job_id: str, filename: str, file_path: str
     ) -> MinerFileUploadResponse:
         """
-        1) POST /get-file-upload-url to get a presigned POST
-        2) Upload the parquet file to S3 using the presigned POST fields
+        1) POST /get-file-upload-url to get a presigned URL
+        2) Upload the parquet file to S3 using POST (DO Spaces) or PUT (R2)
 
         Returns the MinerFileUploadResponse from step (1).
         """
         upload_info = await self.miner_request_file_upload_url(job_id, filename)
-
-        fields = dict(upload_info.fields)
         client = self._ensure_client()
 
         with open(file_path, "rb") as f:
-            files = {"file": (filename, f, "application/octet-stream")}
-            post_resp = await client.post(upload_info.url, data=fields, files=files)
+            if upload_info.method == "PUT":
+                resp = await client.put(
+                    upload_info.url, content=f.read(),
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+            else:
+                files = {"file": (filename, f, "application/octet-stream")}
+                resp = await client.post(upload_info.url, data=dict(upload_info.fields), files=files)
 
-        if not post_resp.is_success:
+        if not resp.is_success:
             raise RuntimeError(
-                f"S3 upload failed: {post_resp.status_code} {post_resp.text}"
+                f"S3 upload failed: {resp.status_code} {resp.text}"
             )
 
         return upload_info
