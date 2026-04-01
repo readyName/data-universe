@@ -129,19 +129,17 @@ class MinerScorer:
 
             # --- State migrations ---
             if saved_version < 6:
-                # -> v6: Full S3 reset — .head() → .sample() fix +
-                # engagement/uniqueness/URL checks. Clean slate for all miners.
+                # -> v6: S3 reset — .head() → .sample() fix +
+                # engagement/uniqueness/URL checks. Clean slate for S3.
                 bt.logging.warning(
                     f"State migration v{saved_version} -> v6: "
-                    f"Full S3 + on-demand reset."
+                    f"S3 score reset."
                 )
                 self.scores.zero_()
                 self.miner_credibility.fill_(MinerScorer.STARTING_CREDIBILITY)
                 self.scorable_bytes.zero_()
                 self.s3_boosts.zero_()
                 self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
-                self.ondemand_boosts.zero_()
-                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
                 self.effective_sizes.zero_()
 
     def get_scores(self) -> torch.Tensor:
