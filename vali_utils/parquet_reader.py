@@ -119,7 +119,7 @@ def read_random_row_group(
         df = table.to_pandas()
 
         if max_rows and len(df) > max_rows:
-            df = df.drop_duplicates(subset=['url']).head(max_rows)
+            df = df.drop_duplicates(subset=['url']).sample(n=min(max_rows, len(df)), random_state=random.randint(0, 2**31))
 
         return df
 
