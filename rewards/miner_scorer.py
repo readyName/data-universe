@@ -400,6 +400,17 @@ class MinerScorer:
             p2p_component = p2p_raw * MinerScorer.P2P_REWARD_SCALE * (new_cred ** MinerScorer._CREDIBILITY_EXP)
             s3_component = float(self.s3_boosts[uid]) * (float(self.s3_credibility[uid]) ** MinerScorer._CREDIBILITY_EXP)
             od_component = float(self.ondemand_boosts[uid]) * (new_od_cred ** MinerScorer._CREDIBILITY_EXP)
+
+            # TEMPORARY: S3 capped at 2x on-demand component.
+            # Prevents fabricators from profiting purely off S3 volume.
+            # Legit miners with real OD participation still get rewarded for S3.
+            # Will be replaced by proper incentive redesign.
+            s3_uncapped = s3_component
+            if od_component > 0:
+                s3_component = min(s3_component, od_component * 2)
+            else:
+                s3_component = 0.0
+
             self.scores[uid] = p2p_component + s3_component + od_component
 
             bt.logging.info(
@@ -407,6 +418,10 @@ class MinerScorer:
                 f"P2P Cred {old_cred:.4f} -> {new_cred:.4f}, "
                 f"OnDemand Cred {old_od_cred:.4f} -> {new_od_cred:.4f}, "
                 f"Boost {old_boost:.2f} -> {new_boost:.2f}, "
+                f"P2P={p2p_component:.0f} (raw={float(self.scorable_bytes[uid]):.0f}, cred={float(self.miner_credibility[uid]):.4f}), "
+                f"S3={s3_component:.0f} (boost={float(self.s3_boosts[uid]):.0f}, cred={float(self.s3_credibility[uid]):.4f})"
+                f"{f', capped from {s3_uncapped:.0f}' if s3_uncapped != s3_component else ''}, "
+                f"OD={od_component:.0f} (boost={float(self.ondemand_boosts[uid]):.0f}, cred={new_od_cred:.4f}), "
                 f"Score {old_score:.2f} -> {float(self.scores[uid]):.2f}"
             )
 
@@ -564,6 +579,6 @@ class MinerScorer:
         )
 
         bt.logging.trace(
-            f"""Evaluated Miner {uid}. Percent of bytes validated succesfully this attempt={credibility * 100}. 
+            f"""Evaluated Miner {uid}. Percent of bytes validated successfully this attempt={credibility * 100}.
                 Previous Credibility={previous_credibility}. New Credibility={self.miner_credibility[uid].item()}."""
         )
