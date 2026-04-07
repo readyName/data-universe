@@ -977,7 +977,7 @@ class Validator:
 
         scorer.recalculate_all_s3_boosts()
 
-        scores = scorer.get_scores()
+        scores = scorer.get_scores_for_weights()
         credibilities = scorer.get_credibilities()
 
         # Check if scores contains any NaN values and log a warning if it does.

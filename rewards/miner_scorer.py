@@ -148,6 +148,36 @@ class MinerScorer:
         with self.lock:
             return self.scores.clone()
 
+    def get_scores_for_weights(self) -> torch.Tensor:
+        """Returns scores with P2P capped at (S3 + OD) for weight setting.
+        """
+        with self.lock:
+            capped_scores = torch.zeros_like(self.scores)
+
+            for uid in range(len(self.scores)):
+                p2p_cred = float(self.miner_credibility[uid] ** MinerScorer._CREDIBILITY_EXP)
+                s3_cred = float(self.s3_credibility[uid] ** MinerScorer._CREDIBILITY_EXP)
+                od_cred = float(self.ondemand_credibility[uid] ** MinerScorer._CREDIBILITY_EXP)
+
+                p2p_component = float(self.scorable_bytes[uid]) * MinerScorer.P2P_REWARD_SCALE * p2p_cred
+                s3_component = float(self.s3_boosts[uid]) * s3_cred
+                od_component = float(self.ondemand_boosts[uid]) * od_cred
+
+                # S3 cap (existing): S3 <= 2x OD
+                s3_uncapped = s3_component
+                if od_component > 0:
+                    s3_component = min(s3_component, od_component * 2)
+                else:
+                    s3_component = 0.0
+
+                # P2P cap: P2P can't exceed S3 + OD
+                service_component = s3_component + od_component
+                p2p_capped = min(p2p_component, service_component) if service_component > 0 else 0.0
+
+                capped_scores[uid] = p2p_capped + s3_component + od_component
+
+            return capped_scores
+
     def get_credibilities(self) -> torch.Tensor:
         """Returns the raw credibilities of all miners."""
         # Return a copy to ensure outside code can't modify the scores.
