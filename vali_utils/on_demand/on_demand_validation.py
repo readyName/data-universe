@@ -410,6 +410,12 @@ class OnDemandValidator:
         miner_responses: Dict[int, List],
         validation_results: Dict[str, bool],
     ) -> Tuple[Dict[int, int], List[int], List[int]]:
+        """Classify sampled miners as successful or failed based on validation.
+
+        Returns (miner_scores, failed_miners, successful_miners) — does NOT
+        call the scorer directly.  The caller is responsible for writing
+        results into the OD job cache.
+        """
         miner_scores = {}
         failed_miners = []
         successful_miners = []
@@ -418,7 +424,6 @@ class OnDemandValidator:
             if not miner_responses[uid]:
                 miner_scores[uid] = 0
                 failed_miners.append(uid)
-                self.evaluator.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
                 ORGANIC_MINER_RESULTS.labels(
                     miner_uid=uid, result_type="failure_empty_submission"
                 ).inc()
@@ -439,7 +444,6 @@ class OnDemandValidator:
             if miner_failed_validation:
                 miner_scores[uid] = 0
                 failed_miners.append(uid)
-                self.evaluator.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
                 ORGANIC_MINER_RESULTS.labels(
                     miner_uid=uid, result_type="failure_content_validation"
                 ).inc()
@@ -480,12 +484,17 @@ class OnDemandValidator:
         miner_data_counts: Dict[int, int],
         requested_limit: Optional[int],
         consensus_count: Optional[float],
-    ) -> List[int]:
+    ) -> Dict[int, float]:
+        """Identify miners with volume underperformance relative to consensus.
+
+        Returns dict of uid -> penalty_mult_factor for penalized miners.
+        Does NOT call the scorer directly — the caller writes to the OD cache.
+        """
         if consensus_count is None:
             bt.logging.info(
                 "Not enough miners with data for consensus - skipping volume penalties"
             )
-            return []
+            return {}
 
         if requested_limit is not None:
             min_consensus_threshold = requested_limit * self.MIN_CONSENSUS
@@ -493,22 +502,19 @@ class OnDemandValidator:
                 bt.logging.info(
                     "Consensus shows limited data available - skipping volume penalties"
                 )
-                return []
+                return {}
 
-        penalized_miners = []
+        penalized_miners = {}
 
         for uid, post_count in miner_data_counts.items():
             if post_count > 0 and post_count < consensus_count:
                 underperformance_ratio = 1.0 - (post_count / consensus_count)
                 if underperformance_ratio > 0.2:
                     mult_factor = min((underperformance_ratio - 0.2) / 0.8, 1.0)
-                    penalized_miners.append(uid)
+                    penalized_miners[uid] = mult_factor
                     bt.logging.info(
                         f"Miner {uid}:{self.metagraph.hotkeys[uid]}: {post_count} posts vs consensus {consensus_count:.1f} "
                         f"({underperformance_ratio:.1%} underperformance, {mult_factor:.2f} penalty)"
-                    )
-                    self.evaluator.scorer.apply_ondemand_penalty(
-                        uid=uid, mult_factor=mult_factor
                     )
                     ORGANIC_MINER_RESULTS.labels(
                         miner_uid=uid,

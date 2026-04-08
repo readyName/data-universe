@@ -3,6 +3,7 @@ import gc
 import copy
 import asyncio
 import datetime
+import random
 import traceback
 import threading
 import time
@@ -37,6 +38,7 @@ from vali_utils.s3_utils import validate_s3_miner_data, get_s3_validation_summar
 from vali_utils.s3_logging_utils import log_s3_validation_table
 
 from rewards.miner_scorer import MinerScorer
+from vali_utils.on_demand.od_job_cache import ODJobCache
 
 
 class MinerEvaluator:
@@ -72,6 +74,13 @@ class MinerEvaluator:
         self.storage = SqliteMemoryValidatorStorage()
         self.s3_storage = S3ValidationStorage(self.config.s3_results_path)
         self.s3_reader = s3_reader
+        # OD job cache — set by validator.py after construction.
+        # eval_miner() drains cached OD results per-miner.
+        self.od_cache: Optional[ODJobCache] = None
+        # OD validator — set by validator.py after construction.
+        # Used for spot-check validation at eval time.
+        self.on_demand_validator = None
+
         # Instantiate runners
         self.should_exit: bool = False
         self.is_running: bool = False
@@ -85,6 +94,158 @@ class MinerEvaluator:
     def eval_miner_sync(self, uid: int) -> None:
         """Synchronous version of eval_miner."""
         asyncio.run(self.eval_miner(uid))
+
+    async def _evaluate_od(self, uid: int, hotkey: str) -> None:
+        """Drain cached OD results for this miner and apply scores.
+
+        Called at the start of eval_miner() so OD rewards/penalties are applied
+        in the same per-miner evaluation flow as P2P and S3.
+
+        1. Apply rewards/penalties for all cached results (speed-based).
+        2. Spot-check: pick one result, fetch the actual submission from the API,
+           download it, and validate a sample entity with the scraper.
+           If validation fails → apply penalty and flip the reward.
+        """
+        if self.od_cache is None:
+            return
+
+        results = self.od_cache.get_and_drain(hotkey)
+        if not results:
+            return
+
+        # Apply all cached results optimistically
+        passed_results = [r for r in results if r.passed_validation is True]
+        failed_results = [r for r in results if r.passed_validation is False]
+
+        for r in passed_results:
+            self.scorer.apply_ondemand_reward(
+                uid=uid,
+                speed_multiplier=r.speed_multiplier,
+                volume_multiplier=r.volume_multiplier,
+            )
+        for r in failed_results:
+            self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+
+        bt.logging.info(
+            f"UID:{uid} - HOTKEY:{hotkey}: Applied {len(results)} cached OD results "
+            f"(rewarded={len(passed_results)}, penalized={len(failed_results)})"
+        )
+
+        # Spot-check: validate one submission to catch fake data
+        if passed_results and self.on_demand_validator is not None:
+            await self._spot_check_od_submission(uid, hotkey, random.choice(passed_results))
+
+    async def _spot_check_od_submission(self, uid: int, hotkey: str, result) -> None:
+        """Download one OD submission and validate a sample entity.
+
+        Fetches the job from the API to get the presigned URL, downloads it,
+        and runs scraper validation on a sample. If it fails, apply a penalty.
+        """
+        from common.api_client import (
+            DataUniverseApiClient,
+            ListJobsWithSubmissionsForValidationRequest,
+            OnDemandMinerUpload,
+        )
+        from vali_utils.on_demand.on_demand_validation import ValidationContext
+
+        try:
+            base_url = self.config.s3_auth_url
+            verify_ssl = "localhost" not in base_url
+
+            async with DataUniverseApiClient(
+                base_url=base_url,
+                verify_ssl=verify_ssl,
+                keypair=self.wallet.hotkey,
+                timeout=60,
+            ) as client:
+                # Fetch the specific job — use a narrow time window
+                resp = await client.validator_list_jobs_with_submissions(
+                    req=ListJobsWithSubmissionsForValidationRequest(
+                        expired_since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=60),
+                        expired_until=dt.datetime.now(dt.timezone.utc),
+                        limit=20,
+                    ),
+                )
+
+            # Find this miner's submission for this job
+            submission = None
+            job = None
+            for jws in resp.jobs_with_submissions:
+                if jws.job.id == result.job_id:
+                    job = jws.job
+                    for sub in jws.submissions:
+                        if sub.miner_hotkey == hotkey and sub.s3_presigned_url:
+                            submission = sub
+                            break
+                    break
+
+            if not submission or not job:
+                bt.logging.debug(
+                    f"UID:{uid} - OD spot-check: job {result.job_id} not found or expired"
+                )
+                return
+
+            # Download the submission data
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                dl_resp = await http.get(submission.s3_presigned_url, follow_redirects=True)
+                if dl_resp.status_code != 200:
+                    bt.logging.debug(f"UID:{uid} - OD spot-check: download failed ({dl_resp.status_code})")
+                    return
+
+                import json
+                miner_upload = OnDemandMinerUpload.model_validate(dl_resp.json())
+
+            if not miner_upload.data_entities:
+                bt.logging.info(f"UID:{uid} - OD spot-check: empty submission for job {result.job_id}")
+                self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+                return
+
+            # Build validation context from the job
+            usernames = []
+            if hasattr(job.job, "usernames") and job.job.usernames:
+                usernames = job.job.usernames
+            elif hasattr(job.job, "channels") and job.job.channels:
+                usernames = job.job.channels
+
+            keywords = []
+            if hasattr(job.job, "keywords") and job.job.keywords:
+                keywords = job.job.keywords
+            if hasattr(job.job, "subreddit") and job.job.subreddit:
+                keywords.insert(0, job.job.subreddit)
+
+            url = None
+            if hasattr(job.job, "url") and job.job.url:
+                url = job.job.url
+
+            ctx = ValidationContext(
+                source=job.job.platform,
+                usernames=usernames,
+                keywords=keywords,
+                url=url,
+                keyword_mode=job.keyword_mode,
+                start_date=job.start_date.isoformat() if job.start_date else None,
+                end_date=job.end_date.isoformat() if job.end_date else None,
+                limit=job.limit,
+            )
+
+            # Validate one random entity
+            entity = random.choice(miner_upload.data_entities)
+            post_id = self.on_demand_validator._get_post_id(entity)
+            is_valid = await self.on_demand_validator._validate_entity(ctx, entity, post_id, uid)
+
+            if not is_valid:
+                bt.logging.warning(
+                    f"UID:{uid} - HOTKEY:{hotkey}: OD spot-check FAILED for job {result.job_id}, post {post_id}"
+                )
+                self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+            else:
+                bt.logging.info(
+                    f"UID:{uid} - HOTKEY:{hotkey}: OD spot-check passed for job {result.job_id}"
+                )
+
+        except Exception as e:
+            bt.logging.debug(f"UID:{uid} - OD spot-check error (non-fatal): {e}")
 
     async def eval_miner(self, uid: int) -> None:
         """Evaluates a miner and updates their score.
@@ -105,6 +266,9 @@ class MinerEvaluator:
             hotkey = self.metagraph.hotkeys[uid]
 
         bt.logging.info(f"UID:{uid} - HOTKEY:{hotkey}: Evaluating miner.")
+
+        # Apply any cached OD results before the main P2P/S3 evaluation
+        await self._evaluate_od(uid, hotkey)
 
         # Query the miner for the latest index.
         index = await self._update_and_get_miner_index(hotkey, uid, axon_info)
