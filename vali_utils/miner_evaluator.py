@@ -169,7 +169,7 @@ class MinerEvaluator:
                     req=ListJobsWithSubmissionsForValidationRequest(
                         expired_since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=60),
                         expired_until=dt.datetime.now(dt.timezone.utc),
-                        limit=20,
+                        limit=10,
                     ),
                 )
 
