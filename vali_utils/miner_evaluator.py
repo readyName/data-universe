@@ -201,14 +201,49 @@ class MinerEvaluator:
                 miner_upload = OnDemandMinerUpload.model_validate(dl_resp.json())
 
             if not miner_upload.data_entities:
-                bt.logging.info(f"UID:{uid} - OD spot-check: empty submission for job {result.job_id}")
-                self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+                # Before penalizing, check if data actually exists for this query.
+                # If the job asks for something that doesn't exist, empty is correct.
+                ctx = OnDemandValidator.build_validation_context(job)
+                data_exists = await self.on_demand_validator.check_data_exists(ctx)
+                if data_exists:
+                    bt.logging.info(
+                        f"UID:{uid} - OD spot-check: empty submission but data exists for job {result.job_id}"
+                    )
+                    self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+                else:
+                    bt.logging.info(
+                        f"UID:{uid} - OD spot-check: empty submission, data doesn't exist — no penalty for job {result.job_id}"
+                    )
                 return
+
+            # Cap entities to job limit — don't reward more than requested
+            entities = miner_upload.data_entities
+            if job.limit and len(entities) > job.limit:
+                bt.logging.info(
+                    f"UID:{uid} - OD spot-check: {hotkey[:16]} returned {len(entities)} "
+                    f"but limit is {job.limit} — capping"
+                )
+                entities = entities[:job.limit]
+
+            # Recalculate actual volume multiplier from real row count.
+            # The poller trusted volume_mult=1.0; if actual count is lower,
+            # apply a corrective penalty proportional to the shortfall.
+            actual_count = len(entities)
+            if job.limit and actual_count < job.limit:
+                actual_volume = actual_count / job.limit
+                shortfall = 1.0 - actual_volume  # e.g. 0.4 if they returned 60%
+                if shortfall > 0.2:
+                    # Significant shortfall — penalize proportionally
+                    self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=shortfall)
+                    bt.logging.info(
+                        f"UID:{uid} - OD spot-check: volume shortfall {actual_count}/{job.limit} "
+                        f"({shortfall:.0%}), penalty applied"
+                    )
 
             ctx = OnDemandValidator.build_validation_context(job)
 
             # Validate one random entity
-            entity = random.choice(miner_upload.data_entities)
+            entity = random.choice(entities)
             post_id = self.on_demand_validator._get_post_id(entity)
             is_valid = await self.on_demand_validator._validate_entity(ctx, entity, post_id, uid)
 
