@@ -37,8 +37,16 @@ from vali_utils.validator_s3_access import ValidatorS3Access
 from vali_utils.s3_utils import validate_s3_miner_data, get_s3_validation_summary, S3ValidationResult
 from vali_utils.s3_logging_utils import log_s3_validation_table
 
+import httpx
+
+from common.api_client import (
+    DataUniverseApiClient,
+    ListJobsWithSubmissionsForValidationRequest,
+    OnDemandMinerUpload,
+)
 from rewards.miner_scorer import MinerScorer
 from vali_utils.on_demand.od_job_cache import ODJobCache
+from vali_utils.on_demand.on_demand_validation import OnDemandValidator
 
 
 class MinerEvaluator:
@@ -113,27 +121,32 @@ class MinerEvaluator:
         if not results:
             return
 
-        # Apply all cached results optimistically
-        passed_results = [r for r in results if r.passed_validation is True]
-        failed_results = [r for r in results if r.passed_validation is False]
+        # Apply all cached results in a single pass
+        passed_count = 0
+        failed_count = 0
+        spot_check_candidate = None
 
-        for r in passed_results:
-            self.scorer.apply_ondemand_reward(
-                uid=uid,
-                speed_multiplier=r.speed_multiplier,
-                volume_multiplier=r.volume_multiplier,
-            )
-        for r in failed_results:
-            self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+        for r in results:
+            if r.passed_validation is True:
+                self.scorer.apply_ondemand_reward(
+                    uid=uid,
+                    speed_multiplier=r.speed_multiplier,
+                    volume_multiplier=r.volume_multiplier,
+                )
+                passed_count += 1
+                spot_check_candidate = r
+            elif r.passed_validation is False:
+                self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+                failed_count += 1
 
         bt.logging.info(
             f"UID:{uid} - HOTKEY:{hotkey}: Applied {len(results)} cached OD results "
-            f"(rewarded={len(passed_results)}, penalized={len(failed_results)})"
+            f"(rewarded={passed_count}, penalized={failed_count})"
         )
 
         # Spot-check: validate one submission to catch fake data
-        if passed_results and self.on_demand_validator is not None:
-            await self._spot_check_od_submission(uid, hotkey, random.choice(passed_results))
+        if spot_check_candidate and self.on_demand_validator is not None:
+            await self._spot_check_od_submission(uid, hotkey, spot_check_candidate)
 
     async def _spot_check_od_submission(self, uid: int, hotkey: str, result) -> None:
         """Download one OD submission and validate a sample entity.
@@ -141,13 +154,6 @@ class MinerEvaluator:
         Fetches the job from the API to get the presigned URL, downloads it,
         and runs scraper validation on a sample. If it fails, apply a penalty.
         """
-        from common.api_client import (
-            DataUniverseApiClient,
-            ListJobsWithSubmissionsForValidationRequest,
-            OnDemandMinerUpload,
-        )
-        from vali_utils.on_demand.on_demand_validation import ValidationContext
-
         try:
             base_url = self.config.s3_auth_url
             verify_ssl = "localhost" not in base_url
@@ -186,14 +192,12 @@ class MinerEvaluator:
                 return
 
             # Download the submission data
-            import httpx
             async with httpx.AsyncClient(timeout=30.0) as http:
                 dl_resp = await http.get(submission.s3_presigned_url, follow_redirects=True)
                 if dl_resp.status_code != 200:
                     bt.logging.debug(f"UID:{uid} - OD spot-check: download failed ({dl_resp.status_code})")
                     return
 
-                import json
                 miner_upload = OnDemandMinerUpload.model_validate(dl_resp.json())
 
             if not miner_upload.data_entities:
@@ -201,33 +205,7 @@ class MinerEvaluator:
                 self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
                 return
 
-            # Build validation context from the job
-            usernames = []
-            if hasattr(job.job, "usernames") and job.job.usernames:
-                usernames = job.job.usernames
-            elif hasattr(job.job, "channels") and job.job.channels:
-                usernames = job.job.channels
-
-            keywords = []
-            if hasattr(job.job, "keywords") and job.job.keywords:
-                keywords = job.job.keywords
-            if hasattr(job.job, "subreddit") and job.job.subreddit:
-                keywords.insert(0, job.job.subreddit)
-
-            url = None
-            if hasattr(job.job, "url") and job.job.url:
-                url = job.job.url
-
-            ctx = ValidationContext(
-                source=job.job.platform,
-                usernames=usernames,
-                keywords=keywords,
-                url=url,
-                keyword_mode=job.keyword_mode,
-                start_date=job.start_date.isoformat() if job.start_date else None,
-                end_date=job.end_date.isoformat() if job.end_date else None,
-                limit=job.limit,
-            )
+            ctx = OnDemandValidator.build_validation_context(job)
 
             # Validate one random entity
             entity = random.choice(miner_upload.data_entities)

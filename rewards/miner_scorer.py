@@ -22,7 +22,8 @@ class MinerScorer:
     # v4: Reset on-demand again after data existence probe + reddit body fix
     # v5: Full reset — engagement/uniqueness/URL checks reveal widespread exploit
     # v6: Reset S3 — .head() → .sample() fix (scraper sampling bypass)
-    STATE_VERSION = 6
+    # v7: Reset OD — moved scoring to evaluator, dropped ^2.5 exponent, fixed credibility decay
+    STATE_VERSION = 7
 
     # Start new miner's at a credibility of 0.
     STARTING_CREDIBILITY = 0
@@ -141,6 +142,23 @@ class MinerScorer:
                 self.s3_boosts.zero_()
                 self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
                 self.effective_sizes.zero_()
+
+            if saved_version < 7:
+                # -> v7: Full reset — OD scoring moved to evaluator, ^2.5 exponent
+                # dropped, credibility decay fixed. P2P cap (min(p2p, s3+od)) means
+                # all scores computed under broken OD are wrong. Clean slate.
+                bt.logging.warning(
+                    f"State migration v{saved_version} -> v7: "
+                    f"Full score reset (OD fix changes all weights)."
+                )
+                self.scores.zero_()
+                self.miner_credibility.fill_(MinerScorer.STARTING_CREDIBILITY)
+                self.scorable_bytes.zero_()
+                self.s3_boosts.zero_()
+                self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
+                self.effective_sizes.zero_()
+                self.ondemand_boosts.zero_()
+                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
 
     def get_scores(self) -> torch.Tensor:
         """Returns the raw scores of all miners."""

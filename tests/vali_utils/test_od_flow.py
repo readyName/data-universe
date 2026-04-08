@@ -65,11 +65,6 @@ class TestODJobCache(unittest.TestCase):
         self.cache.add_results("job1", {"hk_a": self._make_result()})
         self.assertTrue(self.cache.is_job_processed("job1"))
 
-    def test_get_processed_job_ids(self):
-        self.cache.add_results("job1", {"hk_a": self._make_result("job1")})
-        self.cache.add_results("job2", {"hk_b": self._make_result("job2")})
-        self.assertEqual(self.cache.get_processed_job_ids(), {"job1", "job2"})
-
     def test_drain_unknown_hotkey(self):
         self.assertEqual(self.cache.get_and_drain("unknown"), [])
 

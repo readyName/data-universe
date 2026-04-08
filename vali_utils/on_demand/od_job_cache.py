@@ -62,7 +62,7 @@ class ODJobCache:
                 for jid in to_remove:
                     self._processed_jobs.discard(jid)
 
-            bt.logging.info(
+            bt.logging.trace(
                 f"ODJobCache: cached {len(results)} miner results for job {job_id}"
             )
 
@@ -81,7 +81,7 @@ class ODJobCache:
         with self._lock:
             results = self._results.pop(hotkey, [])
             if results:
-                bt.logging.info(
+                bt.logging.trace(
                     f"ODJobCache: drained {len(results)} results for {hotkey[:16]}..."
                 )
             return results
@@ -90,11 +90,6 @@ class ODJobCache:
         """Check if a job has already been cached."""
         with self._lock:
             return job_id in self._processed_jobs
-
-    def get_processed_job_ids(self) -> set:
-        """Return a copy of processed job IDs (for skip-download optimization)."""
-        with self._lock:
-            return set(self._processed_jobs)
 
     def get_pending_miner_count(self) -> int:
         """Return the number of miners with pending results (for monitoring)."""

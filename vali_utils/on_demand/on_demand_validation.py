@@ -46,6 +46,36 @@ class OnDemandValidator:
     PER_MINER_VALIDATION_SAMPLE_SIZE = 2
     MIN_CONSENSUS = 0.3
 
+    @staticmethod
+    def build_validation_context(job) -> "ValidationContext":
+        """Build a ValidationContext from an OD API job object."""
+        usernames = []
+        if hasattr(job.job, "usernames") and job.job.usernames:
+            usernames = job.job.usernames
+        elif hasattr(job.job, "channels") and job.job.channels:
+            usernames = job.job.channels
+
+        keywords = []
+        if hasattr(job.job, "keywords") and job.job.keywords:
+            keywords = job.job.keywords
+        if hasattr(job.job, "subreddit") and job.job.subreddit:
+            keywords.insert(0, job.job.subreddit)
+
+        url = None
+        if hasattr(job.job, "url") and job.job.url:
+            url = job.job.url
+
+        return ValidationContext(
+            source=job.job.platform,
+            usernames=usernames,
+            keywords=keywords,
+            url=url,
+            keyword_mode=job.keyword_mode,
+            start_date=job.start_date.isoformat() if job.start_date else None,
+            end_date=job.end_date.isoformat() if job.end_date else None,
+            limit=job.limit,
+        )
+
     def __init__(self, evaluator):
         self.evaluator = evaluator
 
