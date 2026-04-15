@@ -1033,7 +1033,6 @@ class DuckDBSampledValidator:
                     else:
                         required = {c.lower() for c in self.EXPECTED_COLUMNS_REDDIT}
                     if required - available_cols:
-                        bt.logging.debug(f"Skipping file missing columns: {sorted(required - available_cols)[:5]}")
                         continue
 
                     # Read 1 random row group via Range requests (~3MB vs full scan)
