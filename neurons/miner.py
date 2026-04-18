@@ -195,6 +195,11 @@ class Miner:
         self.on_demand_thread: threading.Thread = None
         self.on_demand_job_queue: asyncio.Queue[OnDemandJob] = asyncio.Queue()
         self.processed_job_ids_cache = utils.LRUSet(capacity=10_000)
+        # Limit concurrent on-demand scrapes to reduce burst traffic / risk of bans
+        # and to avoid wasting paid API calls.
+        self.on_demand_scrape_semaphore: typing.Optional[asyncio.Semaphore] = None
+        # Cap X on-demand limits to control API cost.
+        self.on_demand_x_limit_cap = 60
 
     def refresh_index(self):
         """
@@ -284,6 +289,9 @@ class Miner:
     def run_on_demand(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
+        # Created inside the on-demand thread after event loop setup.
+        self.on_demand_scrape_semaphore = asyncio.Semaphore(2)
 
         poll_task = loop.create_task(self.poll_on_demand_active_jobs())
         process_task = loop.create_task(self.process_on_demand_jobs_queue())
@@ -429,13 +437,22 @@ class Miner:
                     )
                     continue
 
-                task = self.scrape_on_demand_job(job_request=job_request)
-                asyncio.create_task(task)
+                asyncio.create_task(self._bounded_scrape_on_demand_job(job_request))
                 # or
                 # await task
                 # if you want to process 1-1 instead of all in parallel
             except:
                 bt.logging.exception("Failed to process item from on_demand_job_queue")
+
+    async def _bounded_scrape_on_demand_job(self, job_request: OnDemandJob) -> None:
+        """Run scrape under a concurrency semaphore."""
+        if self.on_demand_scrape_semaphore is None:
+            # Should never happen (created in run_on_demand), but keep it safe.
+            await self.scrape_on_demand_job(job_request=job_request)
+            return
+
+        async with self.on_demand_scrape_semaphore:
+            await self.scrape_on_demand_job(job_request=job_request)
 
     async def scrape_on_demand_job(self, job_request: OnDemandJob):
         try:
@@ -467,11 +484,20 @@ class Miner:
                 if rd_job.keywords:
                     keywords.extend(rd_job.keywords)
 
+            requested_limit = job_request.limit
+            capped_limit = requested_limit
+            if data_source == DataSource.X and requested_limit is not None:
+                if requested_limit > self.on_demand_x_limit_cap:
+                    capped_limit = self.on_demand_x_limit_cap
+                    bt.logging.info(
+                        f"On-demand X limit capped: {requested_limit} -> {capped_limit} (job {job_request.id})"
+                    )
+
             # process
             synapse_resp = await self.loop_poll_on_demand_active_jobs(
                 synapse=OnDemandRequest(
                     source=data_source,
-                    limit=job_request.limit,
+                    limit=capped_limit,
                     start_date=(
                         job_request.start_date.isoformat()
                         if job_request.start_date

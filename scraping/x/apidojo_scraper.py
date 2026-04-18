@@ -221,6 +221,31 @@ class ApiDojoTwitterScraper(Scraper):
             dataset=dataset, check_engagement=check_engagement
         )
 
+        # Post-filter + dedup to improve relevance/quality (and reduce duplicates).
+        # Coordinator always passes exactly one label_choices entry per scrape run.
+        # For hashtag labels we keep tweets where the target hashtag appears anywhere
+        # in the hashtag list (instead of forcing the first hashtag to match).
+        if scrape_config.labels:
+            target_label = scrape_config.labels[0].value.lower()
+            if target_label.startswith("#"):
+                x_contents = [
+                    xc
+                    for xc in x_contents
+                    if xc.tweet_hashtags
+                    and any(tag.lower() == target_label for tag in xc.tweet_hashtags)
+                ]
+
+        # Dedup within a single scrape run (by canonicalized URL).
+        dedup_seen = set()
+        deduped: list[XContent] = []
+        for xc in x_contents:
+            key = utils.normalize_url(xc.url).lower()
+            if key in dedup_seen:
+                continue
+            dedup_seen.add(key)
+            deduped.append(xc)
+        x_contents = deduped
+
         bt.logging.success(
             f"Completed scrape for {query}. Scraped {len(x_contents)} items."
         )

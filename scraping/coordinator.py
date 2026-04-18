@@ -1,12 +1,12 @@
 import asyncio
 import functools
+import math
 import random
 import threading
 import traceback
 import bittensor as bt
 import datetime as dt
 from typing import Dict, List, Optional
-import numpy
 from pydantic import Field, PositiveInt, ConfigDict
 from common.date_range import DateRange
 from common.data import DataLabel, DataSource, StrictBaseModel, TimeBucket
@@ -97,11 +97,12 @@ def _choose_scrape_configs(
         chosen_bucket = current_bucket
         # If we have more than 1 bucket to choose from, choose a bucket in the range
         if oldest_bucket.id < current_bucket.id:
-            # Use a triangular distribution for bucket selection
-            chosen_id = int(numpy.random.default_rng().triangular(
-                left=oldest_bucket.id, mode=current_bucket.id, right=current_bucket.id
-            ))
-
+            bucket_ids = list(range(oldest_bucket.id, current_bucket.id + 1))
+            distances = [current_bucket.id - bucket_id for bucket_id in bucket_ids]
+            # Exponential decay gives stronger preference to fresher buckets,
+            # while still occasionally sampling older data for index coverage.
+            weights = [math.exp(-0.5 * distance) for distance in distances]
+            chosen_id = random.choices(bucket_ids, weights=weights, k=1)[0]
             chosen_bucket = TimeBucket(id=chosen_id)
 
         date_range = TimeBucket.to_date_range(chosen_bucket)
@@ -166,7 +167,9 @@ class ScraperCoordinator:
         self.config = config
 
         self.tracker = ScraperCoordinator.Tracker(self.config, dt.datetime.utcnow())
-        self.max_workers = 5
+        # Reduce concurrency to lower the chance of rate-limits/IP bans
+        # and to avoid wasting paid API calls on transient failures.
+        self.max_workers = 2
         self.is_running = False
         self.queue = asyncio.Queue()
 

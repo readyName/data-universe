@@ -15,6 +15,9 @@ myDb
 mydb
 *.sqlite
 
+# Local miner process id (do not commit)
+miner.pid
+
 # C extensions
 *.so
 
