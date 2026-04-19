@@ -41,6 +41,7 @@ import httpx
 
 from common.api_client import (
     DataUniverseApiClient,
+    ListMinerJobsForValidationRequest,
     OnDemandMinerUpload,
 )
 from rewards.miner_scorer import MinerScorer
@@ -83,6 +84,9 @@ class MinerEvaluator:
         # OD validator — set by validator.py after construction.
         # Used for inline OD evaluation during eval_miner().
         self.on_demand_validator: Optional[OnDemandValidator] = None
+        # Track last OD eval time per miner to query only new jobs each cycle.
+        # Not persisted — on restart defaults to a 2h lookback window.
+        self._last_od_eval_at: dict = {}
 
         # Instantiate runners
         self.should_exit: bool = False
@@ -110,16 +114,102 @@ class MinerEvaluator:
         Calls the per-miner jobs endpoint to get this miner's recent OD
         submissions with fresh presigned URLs, then validates a random
         sample and applies per-job rewards/penalties.
-
-        TODO: implement after new API endpoint is ready.
         """
         if self.on_demand_validator is None:
             return
 
-        bt.logging.debug(f"UID:{uid} - HOTKEY:{hotkey}: OD evaluation placeholder (pending new API endpoint)")
+        # Determine time window: since last eval, or 2h on first run
+        now = dt.datetime.now(dt.timezone.utc)
+        expired_since = self._last_od_eval_at.get(
+            hotkey, now - dt.timedelta(hours=2)
+        )
+
+        try:
+            base_url = self.config.s3_auth_url
+            verify_ssl = "localhost" not in base_url
+            async with DataUniverseApiClient(
+                base_url=base_url,
+                verify_ssl=verify_ssl,
+                keypair=self.wallet.hotkey,
+                timeout=60,
+            ) as client:
+                resp = await client.validator_list_miner_jobs(
+                    ListMinerJobsForValidationRequest(
+                        miner_hotkey=hotkey,
+                        expired_since=expired_since,
+                        expired_until=now,
+                        limit=50,
+                    )
+                )
+        except Exception as e:
+            bt.logging.warning(f"UID:{uid} - HOTKEY:{hotkey}: OD API fetch failed: {e}")
+            return
+
+        self._last_od_eval_at[hotkey] = now
+
+        jobs = resp.jobs
+        if not jobs:
+            return
+
+        # Separate empty (0-byte) submissions from real ones
+        empty = [j for j in jobs if (j.submission.s3_content_length or 0) == 0]
+        non_empty = [j for j in jobs if (j.submission.s3_content_length or 0) > 0]
+
+        # Penalize empty submissions
+        for j in empty:
+            self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+
+        if not non_empty:
+            if empty:
+                bt.logging.info(
+                    f"UID:{uid} - HOTKEY:{hotkey}: OD — {len(empty)} empty submissions penalized, "
+                    f"0 non-empty"
+                )
+            return
+
+        # Sample up to OD_MAX_JOBS_TO_VALIDATE for deep validation
+        to_validate = random.sample(
+            non_empty, min(self.OD_MAX_JOBS_TO_VALIDATE, len(non_empty))
+        )
+        to_validate_set = set(id(j) for j in to_validate)
+        not_sampled = [j for j in non_empty if id(j) not in to_validate_set]
+
+        # Validate each sampled job — per-job scoring
+        validated_pass = 0
+        validated_fail = 0
+
+        for j in to_validate:
+            speed_mult, vol_mult = (
+                self.on_demand_validator.calculate_ondemand_reward_multipliers(
+                    job_created_at=j.job.created_at,
+                    submission_timestamp=j.submission.submitted_at,
+                    returned_count=j.job.limit or 100,
+                    requested_limit=j.job.limit,
+                )
+            )
+
+            passed = await self._validate_od_submission(
+                uid, hotkey, j.job, j.submission, j.submission.job_id
+            )
+            if passed:
+                self.scorer.apply_ondemand_reward(uid, speed_mult, vol_mult)
+                validated_pass += 1
+            else:
+                self.scorer.apply_ondemand_penalty(uid, mult_factor=1.0)
+                validated_fail += 1
+
+        # Credibility bump for non-sampled but participating submissions
+        for _ in not_sampled:
+            self.scorer.apply_ondemand_credibility_bump(uid)
+
+        bt.logging.info(
+            f"UID:{uid} - HOTKEY:{hotkey}: OD summary — "
+            f"{len(non_empty)} non-empty (validated: {validated_pass} pass, {validated_fail} fail, "
+            f"{len(not_sampled)} credibility-bumped), {len(empty)} empty penalized"
+        )
 
     async def _validate_od_submission(
-        self, uid: int, hotkey: str, job, submission, cached_result
+        self, uid: int, hotkey: str, job, submission, job_id: str
     ) -> bool:
         """Download and validate a single OD submission.
 
@@ -138,7 +228,7 @@ class MinerEvaluator:
                 if dl_resp.status_code != 200:
                     bt.logging.warning(
                         f"UID:{uid} - OD validate: download failed ({dl_resp.status_code}) "
-                        f"for job {cached_result.job_id}"
+                        f"for job {job_id}"
                     )
                     return False
 
@@ -154,13 +244,13 @@ class MinerEvaluator:
                 if data_exists:
                     bt.logging.info(
                         f"UID:{uid} - OD validate: empty submission but data exists "
-                        f"for job {cached_result.job_id}"
+                        f"for job {job_id}"
                     )
                     return False
                 else:
                     bt.logging.info(
                         f"UID:{uid} - OD validate: empty submission, data doesn't exist "
-                        f"for job {cached_result.job_id} — acceptable"
+                        f"for job {job_id} — acceptable"
                     )
                     return True
 
@@ -177,7 +267,7 @@ class MinerEvaluator:
                 ctx, schema_sample, uid
             ):
                 bt.logging.warning(
-                    f"UID:{uid} - OD validate: SCHEMA FAILED for job {cached_result.job_id} "
+                    f"UID:{uid} - OD validate: SCHEMA FAILED for job {job_id} "
                     f"(wrong XContent format)"
                 )
                 return False
@@ -187,7 +277,7 @@ class MinerEvaluator:
                 post_id = self.on_demand_validator._get_post_id(entity)
                 if not self.on_demand_validator._validate_request_fields(ctx, entity, uid):
                     bt.logging.warning(
-                        f"UID:{uid} - OD validate: JOB MATCH FAILED for job {cached_result.job_id}, "
+                        f"UID:{uid} - OD validate: JOB MATCH FAILED for job {job_id}, "
                         f"post {post_id} (wrong username/keyword/date)"
                     )
                     return False
@@ -200,20 +290,20 @@ class MinerEvaluator:
             )
             if not is_valid:
                 bt.logging.warning(
-                    f"UID:{uid} - OD validate: SCRAPER FAILED for job {cached_result.job_id}, "
+                    f"UID:{uid} - OD validate: SCRAPER FAILED for job {job_id}, "
                     f"post {post_id}"
                 )
                 return False
 
             bt.logging.info(
-                f"UID:{uid} - OD validate: PASSED job {cached_result.job_id} "
+                f"UID:{uid} - OD validate: PASSED job {job_id} "
                 f"({len(entities)} entities, schema OK, job match OK, scraper OK)"
             )
             return True
 
         except Exception as e:
             bt.logging.warning(
-                f"UID:{uid} - OD validate: error for job {cached_result.job_id}: {e}"
+                f"UID:{uid} - OD validate: error for job {job_id}: {e}"
             )
             return False
 
