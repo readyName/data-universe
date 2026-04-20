@@ -24,7 +24,8 @@ class MinerScorer:
     # v6: Reset S3 — .head() → .sample() fix (scraper sampling bypass)
     # v7: Reset OD — moved scoring to evaluator, dropped ^2.5 exponent, fixed credibility decay
     # v8: Reset S3 — strict schema check catches fabricated data; old inflated scores are invalid
-    STATE_VERSION = 8
+    # v9: Reset OD — per-miner endpoint replaces poller; old boost/credibility based on broken lottery
+    STATE_VERSION = 9
 
     # Start new miner's at a credibility of 0.
     STARTING_CREDIBILITY = 0
@@ -175,6 +176,17 @@ class MinerScorer:
                 self.s3_boosts.zero_()
                 self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
                 self.effective_sizes.zero_()
+                self.ondemand_boosts.zero_()
+                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
+
+            if saved_version < 9:
+                # -> v9: Reset OD only. Per-miner endpoint replaces poller; old
+                # boost/credibility reflect the broken lottery scoring, not
+                # real miner OD behavior. S3/P2P state is still valid.
+                bt.logging.warning(
+                    f"State migration v{saved_version} -> v9: "
+                    f"OD boost/credibility reset (new per-miner scoring)."
+                )
                 self.ondemand_boosts.zero_()
                 self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
 
