@@ -33,10 +33,7 @@ from common.metagraph_syncer import MetagraphSyncer
 from neurons.config import NeuronType, check_config, create_config
 from dynamic_desirability.desirability_retrieval import run_retrieval_from_api
 from neurons import __spec_version__ as spec_version
-from common.api_client import (
-    ListJobsWithSubmissionsForValidationRequest,
-    DataUniverseApiClient,
-)
+from common.api_client import DataUniverseApiClient
 from vali_utils.validator_s3_access import ValidatorS3Access
 from rewards.data_value_calculator import DataValueCalculator
 from rich.table import Table
@@ -44,12 +41,10 @@ from rich.console import Console
 import requests
 from dotenv import load_dotenv
 import bittensor as bt
-from typing import Dict
 from common import constants
 from common import utils
 from vali_utils.miner_evaluator import MinerEvaluator
 from vali_utils.on_demand.on_demand_validation import OnDemandValidator
-from vali_utils.on_demand.od_job_cache import ODJobCache, CachedMinerODResult
 from vali_utils import metrics
 
 load_dotenv()
@@ -111,8 +106,6 @@ class Validator:
         )
         bt.logging.info(f"Metagraph: {self.metagraph}.")
 
-        self.on_demand_validator = None
-
         # Event loop is thread-affine; will be created inside the validator run thread.
         self.loop = None
         self.axon = None
@@ -132,9 +125,6 @@ class Validator:
 
         # Add counter for evaluation cycles since startup
         self.evaluation_cycles_since_startup = 0
-        self.od_cache = ODJobCache()
-
-        self.on_demand_thread: threading.Thread = None
 
     def setup(self):
         """A one-time setup method that must be called before the Validator starts its main loop."""
@@ -177,11 +167,8 @@ class Validator:
         else:
             bt.logging.warning("Axon off, not serving ip to chain.")
 
-        self.on_demand_validator = OnDemandValidator(evaluator=self.evaluator)
-
-        # Wire OD components into the evaluator so eval_miner() can drain and validate
-        self.evaluator.od_cache = self.od_cache
-        self.evaluator.on_demand_validator = self.on_demand_validator
+        # Wire OD validator into the evaluator for inline OD evaluation
+        self.evaluator.on_demand_validator = OnDemandValidator(evaluator=self.evaluator)
 
         self.is_setup = True
 
@@ -277,130 +264,6 @@ class Validator:
         self.wandb_run_start = now
 
         bt.logging.debug(f"Started a new wandb run: {name}")
-
-    async def loop_poll_on_demand_jobs_with_submissions(self):
-        while not self.should_exit:
-            bt.logging.info("Pulling on demand jobs with submissions")
-
-            try:
-                async with self._on_demand_client() as client:
-                    # Metadata-only call — no S3 downloads.
-                    # We only need submission timestamps and content_length
-                    # to compute speed multipliers and detect empty submissions.
-                    job_list_resp = (
-                        await client.validator_list_jobs_with_submissions(
-                            req=ListJobsWithSubmissionsForValidationRequest(
-                                expired_since=dt.datetime.now(dt.timezone.utc)
-                                - dt.timedelta(minutes=45),
-                                expired_until=dt.datetime.now(dt.timezone.utc)
-                                - dt.timedelta(minutes=2),
-                                limit=10,
-                            ),
-                        )
-                    )
-            except:
-                bt.logging.exception("Failed to pull on demand jobs with submissions")
-                await asyncio.sleep(20.0)
-                continue
-
-            try:
-                total_submissions = sum(
-                    len(jws.submissions)
-                    for jws in job_list_resp.jobs_with_submissions
-                )
-                bt.logging.info(
-                    f"Pulled {len(job_list_resp.jobs_with_submissions)} jobs "
-                    f"with {total_submissions} total submissions"
-                )
-
-                for (
-                    job_with_submission
-                ) in job_list_resp.jobs_with_submissions:
-                    job = job_with_submission.job
-
-                    if self.od_cache.is_job_processed(job.id):
-                        continue
-
-                    submissions = job_with_submission.submissions
-
-                    # Cache metadata only — the evaluator will download and
-                    # validate content before rewarding.  The poller only
-                    # records who submitted and how fast.
-                    cache_results: Dict[str, CachedMinerODResult] = {}
-
-                    for sub in submissions:
-                        hotkey = sub.miner_hotkey
-
-                        # Skip miners not in metagraph
-                        try:
-                            self.metagraph.hotkeys.index(hotkey)
-                        except ValueError:
-                            continue
-
-                        # Empty submission (0 bytes) → mark as failed
-                        is_empty = (sub.s3_content_length or 0) == 0
-                        if is_empty:
-                            cache_results[hotkey] = CachedMinerODResult(
-                                job_id=job.id,
-                                submitted_at=sub.submitted_at,
-                                returned_count=0,
-                                requested_limit=job.limit,
-                                passed_validation=False,
-                                speed_multiplier=0.0,
-                                volume_multiplier=0.0,
-                                failure_reason="empty_submission",
-                            )
-                            continue
-
-                        # Calculate speed multiplier from submission time
-                        speed_mult, volume_mult = (
-                            self.on_demand_validator.calculate_ondemand_reward_multipliers(
-                                job_created_at=job.created_at,
-                                submission_timestamp=sub.submitted_at,
-                                returned_count=job.limit or 100,
-                                requested_limit=job.limit,
-                            )
-                        )
-
-                        # passed_validation=None means "pending — evaluator
-                        # must download and validate before rewarding"
-                        cache_results[hotkey] = CachedMinerODResult(
-                            job_id=job.id,
-                            submitted_at=sub.submitted_at,
-                            returned_count=job.limit or 100,
-                            requested_limit=job.limit,
-                            passed_validation=None,
-                            speed_multiplier=speed_mult,
-                            volume_multiplier=volume_mult,
-                        )
-
-                    # Write all results to the shared OD cache
-                    self.od_cache.add_results(job.id, cache_results)
-
-                    pending = sum(1 for r in cache_results.values() if r.passed_validation is None)
-                    empty = sum(1 for r in cache_results.values() if r.passed_validation is False)
-                    bt.logging.info(
-                        f"Job {job.id}: cached {len(cache_results)} submitter results "
-                        f"({pending} pending validation, {empty} empty)"
-                    )
-            except:
-                bt.logging.exception(
-                    "Error while validating on demand jobs and submissions"
-                )
-
-            await asyncio.sleep(20.0)
-
-    def run_on_demand(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        poll_task = loop.create_task(self.loop_poll_on_demand_jobs_with_submissions())
-
-        try:
-            loop.run_forever()
-        finally:
-            loop.close()
-            loop = None
 
     def run(self):
         """
@@ -520,11 +383,6 @@ class Validator:
             self.should_exit = False
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
-
-            self.on_demand_thread = threading.Thread(
-                target=self.run_on_demand, daemon=True
-            )
-            self.on_demand_thread.start()
             self.is_running = True
             bt.logging.debug("Started.")
 
@@ -536,7 +394,6 @@ class Validator:
             bt.logging.debug("Stopping validator in background thread.")
             self.should_exit = True
             self.thread.join(5)
-            self.on_demand_thread.join(5)
             self.is_running = False
             bt.logging.debug("Stopped.")
 
@@ -561,7 +418,6 @@ class Validator:
             bt.logging.debug("Stopping validator in background thread.")
             self.should_exit = True
             self.thread.join(5)
-            self.on_demand_thread.join(5)
             self.is_running = False
 
             # Cleanup loggers

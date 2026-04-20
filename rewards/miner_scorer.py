@@ -24,7 +24,8 @@ class MinerScorer:
     # v6: Reset S3 — .head() → .sample() fix (scraper sampling bypass)
     # v7: Reset OD — moved scoring to evaluator, dropped ^2.5 exponent, fixed credibility decay
     # v8: Reset S3 — strict schema check catches fabricated data; old inflated scores are invalid
-    STATE_VERSION = 8
+    # v9: Reset OD — per-miner endpoint replaces poller; old boost/credibility based on broken lottery
+    STATE_VERSION = 9
 
     # Start new miner's at a credibility of 0.
     STARTING_CREDIBILITY = 0
@@ -175,6 +176,17 @@ class MinerScorer:
                 self.s3_boosts.zero_()
                 self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
                 self.effective_sizes.zero_()
+                self.ondemand_boosts.zero_()
+                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
+
+            if saved_version < 9:
+                # -> v9: Reset OD only. Per-miner endpoint replaces poller; old
+                # boost/credibility reflect the broken lottery scoring, not
+                # real miner OD behavior. S3/P2P state is still valid.
+                bt.logging.warning(
+                    f"State migration v{saved_version} -> v9: "
+                    f"OD boost/credibility reset (new per-miner scoring)."
+                )
                 self.ondemand_boosts.zero_()
                 self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
 
@@ -486,23 +498,27 @@ class MinerScorer:
                 f"OD cred: {old_od_cred:.4f} -> {new_od_cred:.4f}"
             )
 
-    def apply_ondemand_credibility_bump(self, uid: int) -> None:
-        """Small credibility bump for miners who submitted to an OD job but weren't sampled.
+    def apply_ondemand_credibility_bump(self, uid: int, count: int = 1) -> None:
+        """Small credibility bump for miners who submitted to OD jobs but weren't sampled.
 
         They participated (good signal) but we didn't verify their data,
         so we give a smaller credibility increase than a validated success.
+
+        Args:
+            uid: Miner UID.
+            count: Number of unsampled submissions to apply (batched, single lock).
         """
         with self.lock:
             old_od_cred = float(self.ondemand_credibility[uid])
-            # Half the normal alpha — participated but unverified
             alpha = MinerScorer.ONDEMAND_CRED_ALPHA * 0.5
-            self.ondemand_credibility[uid] = min(
-                1.0, alpha * 1.0 + (1 - alpha) * self.ondemand_credibility[uid]
-            )
+            for _ in range(count):
+                self.ondemand_credibility[uid] = min(
+                    1.0, alpha * 1.0 + (1 - alpha) * self.ondemand_credibility[uid]
+                )
             new_od_cred = float(self.ondemand_credibility[uid])
 
             bt.logging.trace(
-                f"OnDemand credibility bump (unsampled) for Miner {uid}: "
+                f"OnDemand credibility bump (unsampled ×{count}) for Miner {uid}: "
                 f"OD cred: {old_od_cred:.4f} -> {new_od_cred:.4f}"
             )
 
