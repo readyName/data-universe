@@ -1,46 +1,45 @@
-import os
-from typing import List, Optional
-from apify_client import ApifyClientAsync
-from pydantic import BaseModel, Field, PositiveInt
-import bittensor as bt
+"""
+Legacy Apify actor integration.
 
-from dotenv import load_dotenv
+The optional ``apify-client`` package is no longer required. Actor runs are
+no-ops that return an empty dataset, so miners can run without Apify billing.
+Validators that still need live Apify validation should install ``apify-client``
+and restore a full implementation if required.
+"""
+
+from typing import List, Optional
+
+import bittensor as bt
+from pydantic import Field, PositiveInt
 
 from common.data import StrictBaseModel
 
-load_dotenv()
-
 
 class RunConfig(StrictBaseModel):
-    """Configuration parameters for a single Apify Actor run."""
+    """Parameters for a (stubbed) actor run — kept for API compatibility."""
 
-    api_key: str = Field(
-        description="The Apify API token.",
-        default=os.getenv("APIFY_API_TOKEN"),
-        min_length=1,  # Can't be empty.
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Unused when Apify is disabled.",
     )
-
     actor_id: str = Field(
         description="The ID of the actor to run.",
-        min_length=1,  # Can't be empty.
+        default="",
     )
-
     timeout_secs: PositiveInt = Field(
         description="The timeout for the actor run.",
         default=180,
     )
-
     max_data_entities: PositiveInt = Field(
-        description="The maximum number of items to be returned by the actor. The client will not be charged for more items than this value.",
+        description="Max items hint (unused in stub).",
         default=100,
     )
-
     debug_info: str = Field(
-        description="Optional debug info to include in logs relating to this run."
+        description="Optional debug info for logs.",
+        default="",
     )
-
     memory_mb: Optional[int] = Field(
-        description="The amount of memory in mb to use for this run.", default=None
+        description="Memory hint (unused in stub).", default=None
     )
 
 
@@ -58,39 +57,10 @@ class ActorRunner:
 
     async def run(self, config: RunConfig, run_input: dict) -> List[dict]:
         """
-        Run an Apify actor and return the json results.
-
-        Args:
-            config (ActorConfig): The configuration to use for running the actor.
-            run_input (dict): The input parameters for the actor run.
-
-        Raises:
-            ActorRunError: If the actor run fails, raises an exception, with the run details in the exception message.
-
-        Returns:
-            list[dict]: List of items fetched from the dataset.
+        Stub: does not call Apify. Returns an empty dataset so scrapers exit cleanly.
         """
-
-        client = ApifyClientAsync(config.api_key)
-
-        run = await client.actor(config.actor_id).call(
-            run_input=run_input,
-            max_items=config.max_data_entities,
-            timeout_secs=config.timeout_secs,
-            # If not set, the client will wait indefinitely for the run to finish. Ensure we don't wait forever.
-            wait_secs=config.timeout_secs + 5,
-            memory_mbytes=config.memory_mb,
+        bt.logging.trace(
+            "Apify disabled (stub ActorRunner): returning empty dataset. "
+            f"{config.debug_info or config.actor_id}"
         )
-
-        # We want a success status. Timeout is also okay because it will return partial results.
-        if "status" not in run or not (
-            run["status"].casefold() == "SUCCEEDED".casefold()
-            or run["status"].casefold() == "TIMED-OUT".casefold()
-        ):
-            raise ActorRunError(
-                f"Actor ({config.actor_id}) [{config.debug_info}] failed: {run}"
-            )
-        iterator = client.dataset(run["defaultDatasetId"]).iterate_items()
-        items = [i async for i in iterator]
-
-        return items
+        return []

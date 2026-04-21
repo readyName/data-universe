@@ -6,7 +6,10 @@ from typing import List
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from apify_client import ApifyClientAsync
+try:
+    from apify_client import ApifyClientAsync
+except ImportError:
+    ApifyClientAsync = None
 
 from common.data import DataEntity, DataLabel, DataSource
 from scraping.scraper import ScrapeConfig, Scraper, ScraperId, ValidationResult
@@ -36,11 +39,26 @@ class RedditMCScraper(Scraper):
         Args:
             apify_api_token: Apify API token. If not provided, will read from APIFY_API_TOKEN env var.
         """
+        self.client = None
+        if ApifyClientAsync is None:
+            bt.logging.warning(
+                "apify_client is not installed; Reddit.mc scraper is disabled."
+            )
+            return
         token = apify_api_token or os.getenv("APIFY_API_TOKEN")
+        if not token:
+            bt.logging.warning(
+                "APIFY_API_TOKEN not set; Reddit.mc scraper is disabled."
+            )
+            return
         self.client = ApifyClientAsync(token=token)
 
     async def scrape(self, scrape_config: ScrapeConfig) -> List[DataEntity]:
         """Scrape Reddit using the Apify actor."""
+
+        if self.client is None:
+            bt.logging.trace("RedditMCScraper.scrape skipped (no Apify client).")
+            return []
 
         labels = scrape_config.labels or []
 
@@ -89,6 +107,16 @@ class RedditMCScraper(Scraper):
         """Validate a list of DataEntity objects by scraping their URLs."""
         if not entities:
             return []
+
+        if self.client is None:
+            return [
+                ValidationResult(
+                    is_valid=False,
+                    reason="Apify client unavailable (reddit.mc disabled).",
+                    content_size_bytes_validated=entity.content_size_bytes,
+                )
+                for entity in entities
+            ]
 
         results: List[ValidationResult] = []
 
@@ -306,6 +334,10 @@ async def test_scrape_and_validate():
     bt.logging.info("=" * 60)
 
     scraper = RedditMCScraper()
+
+    if scraper.client is None:
+        bt.logging.warning("Skipping test_scrape_and_validate: Apify client not available.")
+        return
 
     # Test URL - recent Reddit post
     test_url = "https://www.reddit.com/r/bittensor_/comments/1or4vcv/james_altucher_on_bittensor/"

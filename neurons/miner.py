@@ -56,9 +56,9 @@ from common.protocol import OnDemandRequest
 from common.date_range import DateRange
 from scraping.scraper import ScrapeConfig, ScraperId
 
-from scraping.x.apidojo_scraper import ApiDojoTwitterScraper
 from scraping.reddit.reddit_custom_scraper import RedditCustomScraper
 from scraping.reddit.reddit_json_scraper import RedditJsonScraper
+from scraping.x.nitter_rss_scraper import NitterRssTwitterScraper
 import json
 
 from vali_utils.on_demand.output_models import create_organic_output_dict
@@ -744,10 +744,9 @@ class Miner:
 
             bt.logging.info(f"Date range: {start_dt} to {end_dt}")
 
-            # For X source, use the standard scraper with on_demand_scrape
+            # X/Twitter on-demand: Nitter RSS + FxTwitter JSON (no Apify). Configure NITTER_BASE_URL if RSS fails.
             if synapse.source == DataSource.X:
-                # Initialize the standard scraper (now includes low-engagement posts)
-                scraper = ApiDojoTwitterScraper()
+                scraper = NitterRssTwitterScraper()
                 data_entities = await scraper.on_demand_scrape(
                     usernames=synapse.usernames,
                     keywords=synapse.keywords,
@@ -757,8 +756,6 @@ class Miner:
                     end_datetime=end_dt,
                     limit=synapse.limit,
                 )
-
-                # Update response with data entities (already includes all enhanced fields)
                 synapse.data = (
                     data_entities[: synapse.limit] if synapse.limit else data_entities
                 )
