@@ -1,8 +1,9 @@
 """
 X/Twitter scraping without Apify: Nitter RSS for discovery + FxTwitter JSON for validation.
 
-- Set ``NITTER_BASE_URL`` (e.g. ``https://nitter.poast.org``). Public Nitter instances
-  change often; rotate if RSS fails.
+- Set ``NITTER_BASE_URL`` (e.g. ``https://nitter.poast.org``). If you see HTTP **403**,
+  try another instance and/or set ``NITTER_FALLBACK_BASES`` to a comma-separated list
+  of base URLs (each tried in order until one returns 200). Public instances change often.
 - Validation uses the public FxTwitter-compatible JSON API (no Apify key). Third‑party
   services may rate-limit or change; this is best-effort.
 """
@@ -45,9 +46,56 @@ async def _aget(url: str, timeout: float = 45.0) -> requests.Response:
     return await asyncio.to_thread(_sync_get, url, timeout)
 
 
+def _nitter_instance_bases() -> List[str]:
+    primary = os.getenv("NITTER_BASE_URL", "https://nitter.poast.org").strip().rstrip("/")
+    out: List[str] = [primary]
+    for part in os.getenv("NITTER_FALLBACK_BASES", "").split(","):
+        b = part.strip().rstrip("/")
+        if b and b not in out:
+            out.append(b)
+    return out
+
+
 def _nitter_base() -> str:
-    base = os.getenv("NITTER_BASE_URL", "https://nitter.poast.org").rstrip("/")
-    return base
+    return _nitter_instance_bases()[0]
+
+
+def _sync_nitter_rss_get(url: str, referer_base: str, timeout: float = 45.0) -> requests.Response:
+    """Browser-like headers: many Nitter instances return 403 to bot User-Agents."""
+    ref = referer_base.rstrip("/") + "/"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml, application/atom+xml, text/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": ref,
+    }
+    return requests.get(url, timeout=timeout, headers=headers)
+
+
+async def _fetch_nitter_search_rss(q: str) -> Optional[requests.Response]:
+    """Try each configured Nitter base until search RSS returns HTTP 200."""
+    path = f"/search/rss?f=tweets&q={quote(q)}"
+    last_status: Optional[int] = None
+    for base in _nitter_instance_bases():
+        url = f"{base}{path}"
+        try:
+            resp = await asyncio.to_thread(_sync_nitter_rss_get, url, base)
+        except Exception as ex:
+            bt.logging.debug(f"Nitter RSS request error for {base}: {ex}")
+            continue
+        last_status = resp.status_code
+        if resp.status_code == 200:
+            return resp
+        bt.logging.debug(f"Nitter RSS HTTP {resp.status_code} from {base} (try next if any)")
+    bt.logging.warning(
+        f"Nitter search RSS failed on all instance(s); last HTTP {last_status}. "
+        f"Set NITTER_BASE_URL or NITTER_FALLBACK_BASES to a working instance. "
+        f"403 usually means the host blocks automated clients or your IP."
+    )
+    return None
 
 
 def _nitter_link_to_x(url: str) -> str:
@@ -117,7 +165,6 @@ class NitterRssTwitterScraper(Scraper):
 
         label = labels[0].value
         limit = scrape_config.entity_limit or 40
-        base = _nitter_base()
 
         if label.startswith("#"):
             q = label
@@ -126,13 +173,11 @@ class NitterRssTwitterScraper(Scraper):
         else:
             q = label
 
-        rss_url = f"{base}/search/rss?f=tweets&q={quote(q)}"
-        bt.logging.info(f"Nitter RSS scrape: {rss_url}")
+        bt.logging.info(f"Nitter RSS scrape: q={q!r}")
 
         try:
-            resp = await _aget(rss_url)
-            if resp.status_code != 200:
-                bt.logging.error(f"Nitter RSS HTTP {resp.status_code} for {rss_url}")
+            resp = await _fetch_nitter_search_rss(q)
+            if resp is None:
                 return []
         except Exception:
             bt.logging.error(f"Nitter RSS fetch failed: {traceback.format_exc()}")
@@ -335,7 +380,6 @@ class NitterRssTwitterScraper(Scraper):
         if not keywords and not usernames:
             return []
 
-        base = _nitter_base()
         parts: List[str] = []
         if usernames:
             for u in usernames:
@@ -351,19 +395,13 @@ class NitterRssTwitterScraper(Scraper):
         if not q:
             return []
 
-        rss_url = f"{base}/search/rss?f=tweets&q={quote(q)}"
         try:
-            resp = await _aget(rss_url)
-            if resp.status_code != 200:
-                bt.logging.debug(
-                    "Nitter on-demand: RSS HTTP %s for %s",
-                    resp.status_code,
-                    rss_url[:120],
-                )
+            resp = await _fetch_nitter_search_rss(q)
+            if resp is None:
                 return []
             root = ET.fromstring(resp.content)
         except Exception:
-            bt.logging.debug("Nitter on-demand: RSS fetch/parse failed for %s", rss_url[:120])
+            bt.logging.debug(f"Nitter on-demand: RSS parse failed for q={q!r}: {traceback.format_exc()}")
             return []
 
         items = root.findall(".//item")
