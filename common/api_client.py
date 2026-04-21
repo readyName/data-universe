@@ -188,6 +188,28 @@ class ListJobsWithSubmissionForValidationResponse(BaseModel):
     jobs_with_submissions: List[JobWithSubmissions]
 
 
+class ListMinerJobsForValidationRequest(BaseModel):
+    """Request to list OD jobs that a specific miner submitted to."""
+    miner_hotkey: str
+    expired_since: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc) - timedelta(hours=2)
+    )
+    expired_until: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    limit: int = Field(default=500, ge=1, le=1000)
+
+
+class MinerJobForValidation(BaseModel):
+    """A single job + this miner's submission."""
+    job: OnDemandJob
+    submission: OnDemandJobSubmission
+
+
+class ListMinerJobsForValidationResponse(BaseModel):
+    jobs: List[MinerJobForValidation]
+
+
 def _sha256_hex(data: bytes) -> str:
     return sha256(data).hexdigest()
 
@@ -426,6 +448,20 @@ class DataUniverseApiClient:
         return ListJobsWithSubmissionForValidationResponse.model_validate_json(
             resp.text
         )
+
+    async def validator_list_miner_jobs(
+        self, req: ListMinerJobsForValidationRequest
+    ) -> ListMinerJobsForValidationResponse:
+        """List OD jobs that a specific miner submitted to, with fresh presigned URLs."""
+        if not self._signer:
+            raise RuntimeError("validator_keypair was not provided.")
+
+        payload_json = req.model_dump_json()
+        resp = await self._post_signed_json(
+            "/on-demand/validator/miner-jobs", self._signer, payload_json
+        )
+        _raise_for_status(resp)
+        return ListMinerJobsForValidationResponse.model_validate_json(resp.text)
 
     async def validator_list_and_download_submission_json(
         self,
