@@ -83,6 +83,13 @@ def _parse_rfc2822_date(s: Optional[str]) -> Optional[dt.datetime]:
         return None
 
 
+def _to_utc(t: dt.datetime) -> dt.datetime:
+    """Normalize for comparisons: naive → UTC; aware → UTC."""
+    if t.tzinfo is None:
+        return t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
 def _ordered_hashtags(text: str, preferred: str) -> List[str]:
     tags = xutils.extract_hashtags(text)
     pref = preferred.lower()
@@ -348,39 +355,71 @@ class NitterRssTwitterScraper(Scraper):
         try:
             resp = await _aget(rss_url)
             if resp.status_code != 200:
+                bt.logging.debug(
+                    "Nitter on-demand: RSS HTTP %s for %s",
+                    resp.status_code,
+                    rss_url[:120],
+                )
                 return []
             root = ET.fromstring(resp.content)
         except Exception:
+            bt.logging.debug("Nitter on-demand: RSS fetch/parse failed for %s", rss_url[:120])
             return []
 
         items = root.findall(".//item")
         dr_s = start_datetime or (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
         dr_e = end_datetime or dt.datetime.now(dt.timezone.utc)
-        if dr_s.tzinfo is None:
-            dr_s = dr_s.replace(tzinfo=dt.timezone.utc)
-        if dr_e.tzinfo is None:
-            dr_e = dr_e.replace(tzinfo=dt.timezone.utc)
+        dr_s = _to_utc(dr_s)
+        dr_e = _to_utc(dr_e)
 
-        out: List[DataEntity] = []
+        cap = min(limit, 100)
+        parsed: List[Tuple[dt.datetime, str, str, Optional[str]]] = []
         for item in items:
-            if len(out) >= min(limit, 100):
-                break
             title_el = item.find("title")
             link_el = item.find("link")
             pub_el = item.find("pubDate")
             title = (title_el.text or "").strip() if title_el is not None else ""
             link = (link_el.text or "").strip() if link_el is not None else ""
-            ts = _parse_rfc2822_date(pub_el.text if pub_el is not None else None) or dt.datetime.now(
-                dt.timezone.utc
-            )
-            if ts < dr_s or ts > dr_e:
-                continue
+            ts = _parse_rfc2822_date(pub_el.text if pub_el is not None else None)
+            ts = _to_utc(ts or dt.datetime.now(dt.timezone.utc))
             x_url = _nitter_link_to_x(link)
             if not xutils.is_valid_twitter_url(x_url):
                 continue
             uid = _extract_user_id_from_x_url(x_url)
             username = f"@{uid[0]}" if uid else "@unknown"
             tid = uid[1] if uid else None
+            parsed.append((ts, title, x_url, tid))
+
+        in_range = [(ts, title, x_url, tid) for ts, title, x_url, tid in parsed if dr_s <= ts <= dr_e]
+        relax = os.getenv("NITTER_ONDEMAND_RELAX_DATE_RANGE", "").lower() in ("1", "true", "yes")
+        if in_range:
+            rows = in_range[:cap]
+        elif parsed and relax:
+            bt.logging.warning(
+                "Nitter on-demand: 0 items in [%s, %s] UTC but RSS had %s; "
+                "returning recent matches only (NITTER_ONDEMAND_RELAX_DATE_RANGE). "
+                "Validators may reject if dates must match the job window.",
+                dr_s.isoformat(),
+                dr_e.isoformat(),
+                len(parsed),
+            )
+            rows = parsed[:cap]
+        else:
+            if parsed:
+                bt.logging.info(
+                    "Nitter on-demand: RSS returned %s items but none in job window [%s, %s] UTC. "
+                    "Nitter search RSS is recent-only; historical ranges often yield 0. "
+                    "Set NITTER_ONDEMAND_RELAX_DATE_RANGE=1 to return recent hits anyway (best-effort).",
+                    len(parsed),
+                    dr_s.isoformat(),
+                    dr_e.isoformat(),
+                )
+            rows = []
+
+        out: List[DataEntity] = []
+        for ts, title, x_url, tid in rows:
+            uid = _extract_user_id_from_x_url(x_url)
+            username = f"@{uid[0]}" if uid else "@unknown"
             tags = xutils.extract_hashtags(title)
             xc = XContent(
                 username=username,
